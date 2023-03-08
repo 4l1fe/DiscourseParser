@@ -1,4 +1,5 @@
 import json
+import signal
 from pathlib import Path
 from enum import Enum
 from datetime import datetime, timezone
@@ -6,7 +7,6 @@ from threading import RLock, Event
 from dataclasses import dataclass, asdict
 from time import sleep
 from argparse import ArgumentParser
-from signal import signal
 from typing import Union
 from queue import SimpleQueue
 from multiprocessing.pool import ThreadPool
@@ -60,32 +60,47 @@ class CmdLatestParams:
 
 @dataclass
 class ParserLatestArgs:
-    more_url: str = ''
+    url: str = ''
 
 
 @dataclass
 class ParserTopicArgs:
     page: int
     id: int
-    
+
 
 class StopEvent:
 
-    def __init__(self, event):
+    def __init__(self):
         self.event = Event()
-    
-    def received_signal(self): #TODO
-        self.event.set()
-        logger.msg(EventsEnum.stop_signal.value, signal='signal received...')
+        self._set_signal_handlers()
 
+    def handle_terminate(self, sig, frame):
+        self._handle_signal(sig, frame)
+
+    def handle_keyboard_intr(self, sig, frame):
+        self._handle_signal(sig, frame)
+        
     def found_blank(self, url):
         self.event.set()
         logger.msg(EventsEnum.stop_blank.value, url=url)
 
     def is_set(self):
         return self.event.is_set()
-        
 
+    def wait(self):
+        self.event.wait()
+
+    def _handle_signal(self, sig_num, frame):
+        self.event.set()
+        sig_name = signal.Signals(sig_num).name
+        logger.msg(EventsEnum.stop_signal.value, signal=sig_num)
+
+    def _set_signal_handlers(self):
+        signal.signal(signal.SIGINT, self.handle_keyboard_intr)
+        signal.signal(signal.SIGTERM, self.handle_terminate)
+
+        
 class TaskExchanger:
 
     def __init__(self):
@@ -93,16 +108,16 @@ class TaskExchanger:
         self.latest_queue = SimpleQueue()
 
     def get_topic(self):
-        self.topic_queue.get()
+        return self.topic_queue.get()
 
-    def put_topic(self, id_):
-        self.topic_queue.put(id_)
+    def put_topic(self, args):
+        self.topic_queue.put(args)
 
-    def put_latest(self, url):
-        self.latest_queue.put(url)
+    def put_latest(self, args):
+        self.latest_queue.put(args)
 
     def get_latest(self):
-        self.latest_queue.get()
+        return self.latest_queue.get()
         
 
 class TargetDir:
@@ -182,7 +197,7 @@ class Parser:
         while not self.stop_event.is_set():
             args: ParserLatestArgs = self.task_exchanger.get_latest()
 
-            data = self._get_data(self, self.TARGET_LATEST, args)
+            data = self._get_data(self.TARGET_LATEST, args)
                    
             if not data or self._is_blank_response(data):
                 self.stop_event.found_blank(args.url)
@@ -195,7 +210,7 @@ class Parser:
             l_args = ParserLatestArgs(url=new_url)
             self.task_exchanger.put_latest(l_args)  # Let other producers work ASAP
 
-            for topic in self._get_topics(data):
+            for topic in self._extract_topics(data):
                 t_args = ParserTopicArgs(page=page, id=topic['id'])
                 self.task_exchanger.put_topic(t_args)
 
@@ -207,7 +222,7 @@ class Parser:
         while not self.stop_event.is_set():
             args: ParserTopicArgs = self.task_exchanger.get_topic()
             
-            data = self._get_data(self, self.TARGET_TOPIC, args)
+            data = self._get_data( self.TARGET_TOPIC, args)
 
             if not data:
                 continue
@@ -217,12 +232,13 @@ class Parser:
         logger.msg(EventsEnum.done.value)
 
     def _is_blank_response(self, data: dict):
-        if not self._extract_latest_url(data) or not self._get_topics(data):
+        if not self._extract_latest_url(data) or not self._extract_topics(data):
             return True
 
         return False
 
     def _get_data(self, target, args) -> Union[dict, None]:
+        logger.msg('debug', args=args, target=target)
         if target == self.TARGET_TOPIC: # TODO replace with args isinstance() check
             url = TOPIC_URL.format(id=args.id)  # target TARGET_TOPIC
         elif target == self.TARGET_LATEST:
@@ -246,7 +262,7 @@ class Parser:
     def _extract_latest_url(self, data):
         return data.get('topic_list', {}).get('more_topics_url', None)
 
-    def _get_topics(self, data):
+    def _extract_topics(self, data):
         return data.get('topic_list', {}).get('topics', None)
 
     def _extract_current_page(self, url):
@@ -277,10 +293,12 @@ def run_latest(consumers_n=1, producers_n=1,  start_page: int = 0):
     if params.page == 0:  # First page without param
         query_params.pop('page')
     query_params = urlencode(query_params)
-    start_url = LATEST_URL + '?' + query_params
-    task_exchanger.put_latest(start_url)
+    args = ParserLatestArgs(url=LATEST_URL + '?' + query_params)
+    logger.msg('debug', args=args)   
+    task_exchanger.put_latest(args)
 
     # Run pools
+    # signal.raise_signal(signal.SIGTERM)  # TODO delete
     with ThreadPool(producers_n, parser.get_save_latest) as prod_pool, \
             ThreadPool(consumers_n, parser.get_save_topic) as cons_pool:
         stop_event.wait()
