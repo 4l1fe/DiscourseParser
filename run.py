@@ -1,22 +1,26 @@
-import json
-import signal
-from pathlib import Path
-from enum import Enum
 from datetime import datetime, timezone
-from threading import RLock, Event
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from time import sleep
 from argparse import ArgumentParser
 from typing import Union
-from queue import SimpleQueue
-from multiprocessing.pool import ThreadPool
+from threading import Thread
 from urllib.parse import urlencode, urlparse, parse_qsl
+from itertools import chain
+from queue import Empty
 
 import structlog
+from structlog.contextvars import bind_contextvars as bind_log_ctx, \
+                                  bound_contextvars as bound_ctx
 from httpx import Limits, Timeout, Client
+
+from containers import ParserLatestArgs, ParserTopicArgs, CmdLatestParams
+from storage import TargetDir
+from synch import StopEvent, TaskExchanger
+from constants import EventsEnum, FORUM_HOST, LATEST_URL, TOPIC_URL, REQUEST_DELAY
 
 
 structlog.configure(
+    wrapper_class=structlog.BoundLogger,
     processors=[
         structlog.contextvars.merge_contextvars,
         structlog.processors.StackInfoRenderer(),
@@ -31,158 +35,11 @@ structlog.configure(
     cache_logger_on_first_use=False
 )
 logger = structlog.get_logger()
-
-FORUM_HOST = 'https://discuss.streamlit.io'
-LATEST_URL = '/latest'
-TOPIC_URL = '/t/{id}'
-
-
-class EventsEnum(Enum):
-    error_connection = 'error.connection'
-    error_http = 'error.http'
-    error_file = 'error.file'
-    data_received = 'data.received'
-    data_saved = 'data.saved'
-    started = 'started'
-    do = 'do'
-    done = 'done'
-    finished = 'finished'
-    stop_signal = 'stop.signal'
-    stop_blank = 'stop.blank'
-
-
-@dataclass
-class CmdLatestParams:
-    order: str = 'created'
-    ascending: bool = False
-    page: int = 0
-
-
-@dataclass
-class ParserLatestArgs:
-    url: str = ''
-
-
-@dataclass
-class ParserTopicArgs:
-    page: int
-    id: int
-
-
-class StopEvent:
-
-    def __init__(self):
-        self.event = Event()
-        self._set_signal_handlers()
-
-    def handle_terminate(self, sig, frame):
-        self._handle_signal(sig, frame)
-
-    def handle_keyboard_intr(self, sig, frame):
-        self._handle_signal(sig, frame)
-        
-    def found_blank(self, url):
-        self.event.set()
-        logger.msg(EventsEnum.stop_blank.value, url=url)
-
-    def is_set(self):
-        return self.event.is_set()
-
-    def wait(self):
-        self.event.wait()
-
-    def _handle_signal(self, sig_num, frame):
-        self.event.set()
-        sig_name = signal.Signals(sig_num).name
-        logger.msg(EventsEnum.stop_signal.value, signal=sig_num)
-
-    def _set_signal_handlers(self):
-        signal.signal(signal.SIGINT, self.handle_keyboard_intr)
-        signal.signal(signal.SIGTERM, self.handle_terminate)
-
-        
-class TaskExchanger:
-
-    def __init__(self):
-        self.topic_queue = SimpleQueue()
-        self.latest_queue = SimpleQueue()
-
-    def get_topic(self):
-        return self.topic_queue.get()
-
-    def put_topic(self, args):
-        self.topic_queue.put(args)
-
-    def put_latest(self, args):
-        self.latest_queue.put(args)
-
-    def get_latest(self):
-        return self.latest_queue.get()
-        
-
-class TargetDir:
-    TARGET_LATEST = 1
-    TARGET_TOPIC = 2
-    
-    def __init__(self, method: str, params: CmdLatestParams, start_iso_date: str):
-        self.start_iso_date = start_iso_date
-        self.target_dir = self._create_target_dir(method, params)
-        self.rlock = RLock()
-    
-    def write_latest(self, page, data):
-        self._write_data(self.TARGET_LATEST, page, data)
-
-    def write_topic(self, page, data, topic_id):
-        self._write_data(self.TARGET_TOPIC, page, data, topic_id)
-
-    def get_latest_path(self) -> Path:
-        p = self.target_dir / f'latest-{self.start_iso_date}.json'
-        return p
-
-    def get_topic_path(self, topic_id) -> Path:
-        p = self.target_dir / f'topic-{topic_id}-{self.start_iso_date}.json'
-        return p
-
-    def _create_target_dir(self, method, params):
-        '''Subdirs order derives from the Params class attributes order'''
-
-        p = Path(method)
-        parts = asdict(params)
-        
-        for key, value in parts.items():
-            p = p / f'{key}-{value}'
-
-        p.mkdir(parents=True, exist_ok=True)
-
-        return p
-
-    def _set_page(self, page):
-        with self.rlock:
-            if not page:
-                page = 0  # The only case when 0 is first page?
-            self.target_dir = self.target_dir.parent / f'page-{page}'
-            self.target_dir.mkdir(exist_ok=True)
-    
-    def _write_data(self, target, page, data, *args):
-        with self.rlock:
-            self._set_page(page)
-            text = json.dumps(data)
-            get_path = self.get_topic_path
-            if target == self.TARGET_LATEST:
-                get_path = self.get_latest_path
-
-            try:
-                p = get_path(*args)
-                p.write_text(text)        
-                logger.msg(EventsEnum.data_saved.value, file=p.as_posix())
-            except Exception as e:
-                logger.msg(EventsEnum.error_file.value, exc_info=e,
-                           path=self.target_dir.as_posix(), args=args)
-
+       
 
 class Parser:
-    TARGET_LATEST = 1
-    TARGET_TOPIC = 2
+    TARGET_LATEST = 'latest'
+    TARGET_TOPIC = 'topic'
     
     def __init__(self, client, target_dir: TargetDir, stop_event: StopEvent,
                  task_exchanger: TaskExchanger):
@@ -191,45 +48,53 @@ class Parser:
         self.stop_event = stop_event
         self.task_exchanger = task_exchanger
 
-    def get_save_latest(self):
+    def parse_target(self, target):
+        bind_log_ctx(target=target)
         logger.msg(EventsEnum.do.value)
 
-        while not self.stop_event.is_set():
-            args: ParserLatestArgs = self.task_exchanger.get_latest()
-
-            data = self._get_data(self.TARGET_LATEST, args)
-                   
-            if not data or self._is_blank_response(data):
-                self.stop_event.found_blank(args.url)
-                continue  # return pass logging
-
-            page = self._extract_current_page(args.url)
-            self.target_dir.write_latest(page, data)
-
-            new_url = self._extract_latest_url(data)
-            l_args = ParserLatestArgs(url=new_url)
-            self.task_exchanger.put_latest(l_args)  # Let other producers work ASAP
-
-            for topic in self._extract_topics(data):
-                t_args = ParserTopicArgs(page=page, id=topic['id'])
-                self.task_exchanger.put_topic(t_args)
-
-        logger.msg(EventsEnum.done.value)
-        
-    def get_save_topic(self):
-        logger.msg(EventsEnum.do.value)
-
-        while not self.stop_event.is_set():
-            args: ParserTopicArgs = self.task_exchanger.get_topic()
+        target_method = self.get_save_topic 
+        get_args_method = self.task_exchanger.get_topic
+        if target == self.TARGET_LATEST:
+            target_method = self.get_save_latest
+            get_args_method = self.task_exchanger.get_latest
             
-            data = self._get_data( self.TARGET_TOPIC, args)
+        while not self.stop_event.is_set():
+            try:
+                args = get_args_method()
+            except Empty:
+                continue  # Do getting args or leave
 
-            if not data:
-                continue
-                
-            self.target_dir.write_topic(args.page, data, args.id)
+            with bound_ctx(args=asdict(args)):
+                sleep(REQUEST_DELAY)
+                target_method(args)
 
         logger.msg(EventsEnum.done.value)
+
+    def get_save_latest(self, args: ParserLatestArgs):
+        data = self._get_data(self.TARGET_LATEST, args)
+               
+        if not data or self._is_blank_response(data):
+            self.stop_event.found_blank()
+            return  # return passes logging
+
+        page = self._extract_current_page(args.url)
+        self.target_dir.write_latest(page, data)
+
+        new_url = self._extract_latest_url(data)
+        l_args = ParserLatestArgs(url=new_url)
+        self.task_exchanger.put_latest(l_args)  # Let other producers work ASAP
+
+        for topic in self._extract_topics(data):
+            t_args = ParserTopicArgs(page=page, id=topic['id'])
+            self.task_exchanger.put_topic(t_args)
+
+    def get_save_topic(self, args: ParserTopicArgs):        
+        data = self._get_data(self.TARGET_TOPIC, args)
+
+        if not data:
+            return
+            
+        self.target_dir.write_topic(args.page, data, args.id)
 
     def _is_blank_response(self, data: dict):
         if not self._extract_latest_url(data) or not self._extract_topics(data):
@@ -238,13 +103,13 @@ class Parser:
         return False
 
     def _get_data(self, target, args) -> Union[dict, None]:
-        logger.msg('debug', args=args, target=target)
         if target == self.TARGET_TOPIC: # TODO replace with args isinstance() check
             url = TOPIC_URL.format(id=args.id)  # target TARGET_TOPIC
         elif target == self.TARGET_LATEST:
             url = args.url  # take as is in response
 
         try:
+            logger.msg(EventsEnum.data_get.value)
             resp = self.client.get(url)
         except Exception as e:
             logger.msg(EventsEnum.error_connection.value, exc_info=e)
@@ -253,7 +118,7 @@ class Parser:
         try:
             resp.raise_for_status()
             data = resp.json()
-            logger.msg(EventsEnum.data_received.value, url=url)
+            logger.msg(EventsEnum.data_received.value)
             return data
         except Exception as e:
             logger.msg(EventsEnum.error_http.value, exc_info=e)
@@ -294,22 +159,39 @@ def run_latest(consumers_n=1, producers_n=1,  start_page: int = 0):
         query_params.pop('page')
     query_params = urlencode(query_params)
     args = ParserLatestArgs(url=LATEST_URL + '?' + query_params)
-    logger.msg('debug', args=args)   
     task_exchanger.put_latest(args)
 
     # Run pools
-    # signal.raise_signal(signal.SIGTERM)  # TODO delete
-    with ThreadPool(producers_n, parser.get_save_latest) as prod_pool, \
-            ThreadPool(consumers_n, parser.get_save_topic) as cons_pool:
-        stop_event.wait()
+    prod_pool = [Thread(target=parser.parse_target,
+                        args=(parser.TARGET_LATEST, ),
+                        name=f'Producer-{i}',
+                        daemon=True)
+                 for i in range(1, producers_n + 1) ] 
+    cons_pool = [Thread(target=parser.parse_target,
+                        args=(parser.TARGET_TOPIC, ),
+                        name=f'Consumer-{i}',
+                        daemon=True)
+                 for i in range(1, consumers_n + 1) ] 
+
+    # Let the consumerts get started first
+    for thread in chain(cons_pool, prod_pool):
+        thread.start()
+
+    logger.msg('stop.wait')
+    stop_event.wait()
+        
+    # Normal termination
+    logger.msg('threads.join')
+    for thread in chain(cons_pool, prod_pool):
+        thread.join()
 
     logger.msg(EventsEnum.finished.value)
 
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--consumers', type=int, default=1)
-    parser.add_argument('--producers', type=int, default=1)
+    parser.add_argument('-cn', '--consumers', type=int, default=1)
+    parser.add_argument('-pn', '--producers', type=int, default=1)
 
     subparsers = parser.add_subparsers(dest='command')
 
@@ -321,5 +203,5 @@ if __name__ == '__main__':
         run_latest(consumers_n=args.consumers,
                    producers_n=args.producers,
                    start_page=args.page)
-        
+    
       
