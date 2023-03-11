@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 from dataclasses import asdict
-from time import sleep
-from argparse import ArgumentParser
 from typing import Union
 from threading import Thread
 from urllib.parse import urlencode, urlparse, parse_qsl
@@ -12,11 +10,12 @@ import structlog
 from structlog.contextvars import bind_contextvars as bind_log_ctx, \
                                   bound_contextvars as bound_ctx
 from httpx import Limits, Timeout, Client
+from pyrate_limiter import Duration, RequestRate, Limiter
 
 from containers import ParserLatestArgs, ParserTopicArgs, CmdLatestParams
 from storage import TargetDir
 from synch import StopEvent, TaskExchanger
-from constants import EventsEnum, FORUM_HOST, LATEST_URL, TOPIC_URL, REQUEST_DELAY
+from constants import EventsEnum, FORUM_HOST, LATEST_URL, TOPIC_URL
 
 
 structlog.configure(
@@ -35,18 +34,21 @@ structlog.configure(
     cache_logger_on_first_use=False
 )
 logger = structlog.get_logger()
-       
+ 
 
 class Parser:
     TARGET_LATEST = 'latest'
     TARGET_TOPIC = 'topic'
     
     def __init__(self, client, target_dir: TargetDir, stop_event: StopEvent,
-                 task_exchanger: TaskExchanger):
+                 task_exchanger: TaskExchanger, prods_limiter: Limiter,
+                 cons_limiter: Limiter):
         self.client = client
         self.target_dir = target_dir
         self.stop_event = stop_event
         self.task_exchanger = task_exchanger
+        self.prods_limiter = prods_limiter
+        self.cons_limiter = cons_limiter
 
     def parse_target(self, target):
         bind_log_ctx(target=target)
@@ -65,7 +67,7 @@ class Parser:
                 continue  # Do getting args or leave
 
             with bound_ctx(args=asdict(args)):
-                sleep(REQUEST_DELAY)
+                # sleep(REQUEST_DELAY)
                 target_method(args)
 
         logger.msg(EventsEnum.done.value)
@@ -105,12 +107,15 @@ class Parser:
     def _get_data(self, target, args) -> Union[dict, None]:
         if target == self.TARGET_TOPIC: # TODO replace with args isinstance() check
             url = TOPIC_URL.format(id=args.id)  # target TARGET_TOPIC
+            rate_limiter = self.cons_limiter
         elif target == self.TARGET_LATEST:
             url = args.url  # take as is in response
+            rate_limiter = self.prods_limiter
 
         try:
             logger.msg(EventsEnum.data_get.value)
-            resp = self.client.get(url)
+            with rate_limiter.ratelimit('default-idnt', delay=True):
+                resp = self.client.get(url)
         except Exception as e:
             logger.msg(EventsEnum.error_connection.value, exc_info=e)
             return
@@ -143,15 +148,18 @@ def run_latest(consumers_n=1, producers_n=1,  start_page: int = 0):
     method = 'latest'
     timeout = Timeout(15.0)
     client = Client(base_url=FORUM_HOST, headers={'accept': 'application/json'},
-                    limits=Limits(max_connections=consumers_n + producers_n,
-                                  max_keepalive_connections=consumers_n + producers_n,
+                    limits=Limits(max_connections=10,
+                                  max_keepalive_connections=10,
                                   keepalive_expiry=5),
                     timeout=timeout)
     stop_event = StopEvent()
     params = CmdLatestParams(page=start_page)
     target_dir = TargetDir(method, params, start_iso_date)
     task_exchanger = TaskExchanger()
-    parser = Parser(client, target_dir, stop_event, task_exchanger)
+    prods_limiter = Limiter(RequestRate(0.2, Duration.SECOND),
+                            RequestRate(6, Duration.MINUTE))
+    cons_limiter = Limiter(RequestRate(3, Duration.SECOND))
+    parser = Parser(client, target_dir, stop_event, task_exchanger, prods_limiter, cons_limiter)
 
     # Create and enqueue a start url
     query_params = asdict(params)
@@ -187,21 +195,3 @@ def run_latest(consumers_n=1, producers_n=1,  start_page: int = 0):
 
     logger.msg(EventsEnum.finished.value)
 
-
-if __name__ == '__main__':
-    parser = ArgumentParser()
-    parser.add_argument('-cn', '--consumers', type=int, default=1)
-    parser.add_argument('-pn', '--producers', type=int, default=1)
-
-    subparsers = parser.add_subparsers(dest='command')
-
-    latest_parser = subparsers.add_parser('latest')
-    latest_parser.add_argument('-p', '--page', type=int, default=0)
-
-    args = parser.parse_args()
-    if args.command == 'latest':
-        run_latest(consumers_n=args.consumers,
-                   producers_n=args.producers,
-                   start_page=args.page)
-    
-      
