@@ -1,5 +1,7 @@
 from enum import Enum
 
+from pyrate_limiter import RequestRate, Duration
+
 
 FORUM_HOST = 'https://discuss.streamlit.io'
 LATEST_URL = '/latest'
@@ -22,3 +24,17 @@ class EventsEnum(Enum):
     stop_signal = 'stop.signal'
     stop_blank = 'stop.blank'
     task_get = 'task.get'
+
+
+class TargetsEnum(Enum):
+    TOPIC = 'topic'
+    LATEST = 'latest'
+
+
+class RunDefaults:
+    consumers_n = 1
+    producers_n = 1
+    start_page = 0
+    prod_rates = [RequestRate(0.2, Duration.SECOND),
+                  RequestRate(6, Duration.MINUTE)],
+    cons_rates = [RequestRate(3, Duration.SECOND), ]

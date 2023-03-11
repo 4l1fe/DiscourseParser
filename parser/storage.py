@@ -6,26 +6,24 @@ from dataclasses import asdict
 import structlog
 
 from containers import CmdLatestParams
-from constants import EventsEnum
+from constants import EventsEnum, TargetsEnum
 
 
 logger = structlog.get_logger()
 
 
 class TargetDir:
-    PATH_LATEST = 'latest'
-    PATH_TOPIC = 'topic'
     
     def __init__(self, method: str, params: CmdLatestParams, start_iso_date: str):
         self.start_iso_date = start_iso_date
         self.target_dir = self._create_target_dir(method, params)
         self.rlock = RLock()
-    
+
     def write_latest(self, page, data):
-        self._write_data(self.PATH_LATEST, page, data)
+        self._write_data(TargetsEnum.LATEST, page, data)
 
     def write_topic(self, page, data, topic_id):
-        self._write_data(self.PATH_TOPIC, page, data, topic_id)
+        self._write_data(TargetsEnum.TOPIC, page, data, topic_id)
 
     def get_latest_path(self) -> Path:
         p = self.target_dir / f'latest-{self.start_iso_date}.json'
@@ -55,12 +53,12 @@ class TargetDir:
             self.target_dir = self.target_dir.parent / f'page-{page}'
             self.target_dir.mkdir(exist_ok=True)
     
-    def _write_data(self, path_id, page, data, *args):
+    def _write_data(self, target: TargetsEnum, page, data, *args):
         with self.rlock:
             self._set_page(page)
             text = json.dumps(data)
             get_path = self.get_topic_path
-            if path_id == self.PATH_LATEST:
+            if target == TargetsEnum.LATEST:
                 get_path = self.get_latest_path
             
             p = get_path(*args)
