@@ -50,7 +50,7 @@ class StopEvent:
         if sig_num == signal.SIGINT:
             self.producers_stopped.set()
         elif sig_num == signal.SIGTERM:
-            self.all_stopped().set()
+            self.all_stopped.set()
             
         sig_name = signal.Signals(sig_num).name
         logger.msg(EventsEnum.stop_signal.value, signal=sig_name)

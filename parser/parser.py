@@ -184,7 +184,7 @@ def run_latest(host,
                         daemon=True)
                  for i in range(1, consumers_n + 1) ] 
 
-    # Let the consumerts get started first
+    # Let the consumers get started first
     for thread in chain(cons_pool, prod_pool):
         thread.start()
 
